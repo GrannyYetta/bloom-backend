@@ -10,15 +10,17 @@ import { SubscriptionUserService } from 'src/subscription-user/subscription-user
 import { TherapySessionService } from 'src/therapy-session/therapy-session.service';
 import { SIGNUP_TYPE } from 'src/utils/constants';
 import { FIREBASE_ERRORS } from 'src/utils/errors';
+import { FIREBASE_EVENTS, USER_SERVICE_EVENTS } from 'src/utils/logs';
 import {
   createServiceUserProfiles,
+  updateServiceUserEmailAndProfiles,
   updateServiceUserProfilesUser,
 } from 'src/utils/serviceUserProfiles';
 import { And, ILike, IsNull, Not, Raw, Repository } from 'typeorm';
 import { deleteCypressCrispProfiles } from '../api/crisp/crisp-api';
 import { AuthService } from '../auth/auth.service';
 import { PartnerAccessService, basePartnerAccess } from '../partner-access/partner-access.service';
-import { formatGetUsersObject, formatUserObject } from '../utils/serialize';
+import { formatUserObject } from '../utils/serialize';
 import { generateRandomString } from '../utils/utils';
 import { CreateUserDto } from './dtos/create-user.dto';
 import { GetUserDto } from './dtos/get-user.dto';
@@ -191,11 +193,25 @@ export class UserService {
     return await this.deleteUser(user);
   }
 
-  public async updateUser(updateUserDto: Partial<UpdateUserDto>, { user: { id } }: GetUserDto) {
-    const user = await this.userRepository.findOneBy({ id });
+  public async updateUser(updateUserDto: Partial<UpdateUserDto>, userId: string) {
+    const user = await this.userRepository.findOneBy({ id: userId });
 
     if (!user) {
       throw new HttpException('USER NOT FOUND', HttpStatus.NOT_FOUND);
+    }
+
+    if (updateUserDto.email && user.email !== updateUserDto.email) {
+      // check whether email has been updated already in firebase
+      const firebaseUser = await this.authService.getFirebaseUser(user.email);
+      if (firebaseUser.email !== updateUserDto.email) {
+        await this.authService.updateFirebaseUserEmail(user.firebaseUid, updateUserDto.email);
+        this.logger.log({ event: FIREBASE_EVENTS.UPDATE_FIREBASE_USER_EMAIL, userId: user.id });
+      } else {
+        this.logger.log({
+          event: FIREBASE_EVENTS.UPDATE_FIREBASE_EMAIL_ALREADY_UPDATED,
+          userId: user.id,
+        });
+      }
     }
 
     const newUserData: UserEntity = {
@@ -203,11 +219,19 @@ export class UserService {
       ...updateUserDto,
     };
     const updatedUser = await this.userRepository.save(newUserData);
+    this.logger.log({
+      event: USER_SERVICE_EVENTS.USER_UPDATED,
+      userId: user.id,
+      fields: Object.keys(updateUserDto),
+    });
 
-    const isCrispBaseUpdateRequired =
-      (user.signUpLanguage !== updateUserDto.signUpLanguage && user.name !== updateUserDto.name) ||
-      user.lastActiveAt !== updateUserDto.lastActiveAt;
-    updateServiceUserProfilesUser(user, isCrispBaseUpdateRequired, user.email);
+    if (updateUserDto.email && user.email !== updateUserDto.email) {
+      updateServiceUserEmailAndProfiles(newUserData, user.email);
+    } else {
+      const isCrispBaseUpdateRequired =
+        user.signUpLanguage !== updateUserDto.signUpLanguage && user.name !== updateUserDto.name;
+      updateServiceUserProfilesUser(newUserData, isCrispBaseUpdateRequired, user.email);
+    }
 
     return updatedUser;
   }
@@ -266,20 +290,12 @@ export class UserService {
       partnerAccess?: { userId: string; featureTherapy: boolean; active: boolean };
       partnerAdmin?: { partnerAdminId: string };
     },
-    relations: {
-      partner?: boolean;
-      partnerAccess?: boolean;
-      partnerAdmin?: boolean;
-      courseUser?: boolean;
-      subscriptionUser?: boolean;
-      therapySession?: boolean;
-      eventLog?: boolean;
-    },
+    relations: string[],
     fields: Array<string>,
     limit: number,
-  ): Promise<GetUserDto[] | undefined> {
+  ): Promise<UserEntity[] | undefined> {
     const users = await this.userRepository.find({
-      relations: relations,
+      relations,
       where: {
         ...(filters.email && { email: ILike(`%${filters.email}%`) }),
         ...(filters.partnerAccess && {
@@ -306,9 +322,7 @@ export class UserService {
       },
       ...(limit && { take: limit }),
     });
-
-    const usersDto = users.map((user) => formatGetUsersObject(user));
-    return usersDto;
+    return users;
   }
 
   // Static bulk upload function to be used in specific cases
@@ -332,7 +346,6 @@ export class UserService {
       });
       const usersWithCourseUsers = users.filter((user) => user.courseUser.length > 0);
 
-      console.log(usersWithCourseUsers);
       await batchCreateMailchimpProfiles(usersWithCourseUsers);
       this.logger.log(
         `Created batch mailchimp profiles for ${usersWithCourseUsers.length} users, created before ${filterStartDate}`,

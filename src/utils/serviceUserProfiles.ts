@@ -90,13 +90,41 @@ export const updateServiceUserProfilesUser = async (
     if (isCrispBaseUpdateRequired) {
       // Extra call required to update crisp "base" profile when name or sign up language is changed
       await updateCrispProfileBase(
-        { person: { nickname: user.name, locales: [user.signUpLanguage || 'en'] } },
+        {
+          person: {
+            nickname: user.name,
+            locales: [user.signUpLanguage || 'en'],
+          },
+        },
         email,
       );
     }
     const userData = serializeUserData(user);
     await updateCrispProfile(userData.crispSchema, email);
     await updateMailchimpProfile(userData.mailchimpSchema, email);
+  } catch (error) {
+    logger.error(`Update service user profiles user error - ${error}`);
+  }
+};
+
+export const updateServiceUserEmailAndProfiles = async (user: UserEntity, email: string) => {
+  try {
+    await updateCrispProfileBase(
+      {
+        email: user.email,
+        person: {
+          nickname: user.name,
+          locales: [user.signUpLanguage || 'en'],
+        },
+      },
+      email,
+    );
+    logger.log({ event: 'UPDATE_CRISP_PROFILE_BASE', userId: user.id });
+    const userData = serializeUserData(user);
+    await updateCrispProfile(userData.crispSchema, user.email);
+    logger.log({ event: 'UPDATE_CRISP_PROFILE', userId: user.id });
+    await updateMailchimpProfile({ ...userData.mailchimpSchema, email_address: user.email }, email);
+    logger.log({ event: 'UPDATE_MAILCHIMP_PROFILE', userId: user.id });
   } catch (error) {
     logger.error(`Update service user profiles user error - ${error}`);
   }
@@ -205,7 +233,9 @@ export const createCompleteMailchimpUserProfile = (user: UserEntity): ListMember
 };
 
 export const serializePartnersString = (partnerAccesses: PartnerAccessEntity[]) => {
-  return partnerAccesses?.map((pa) => pa.partner.name.toLowerCase()).join('; ') || '';
+  const partnersNames = partnerAccesses?.map((pa) => pa.partner.name.toLowerCase());
+  const partnersString = partnersNames ? [...new Set(partnersNames)].join('; ') : '';
+  return partnersString;
 };
 
 const serializeCrispPartnerSegments = (partners: PartnerEntity[]) => {
@@ -213,14 +243,22 @@ const serializeCrispPartnerSegments = (partners: PartnerEntity[]) => {
   return partners.map((p) => p.name.toLowerCase());
 };
 
-const serializeUserData = (user: UserEntity) => {
-  const { name, signUpLanguage, contactPermission, serviceEmailsPermission, lastActiveAt } = user;
+export const serializeUserData = (user: UserEntity) => {
+  const {
+    name,
+    signUpLanguage,
+    contactPermission,
+    serviceEmailsPermission,
+    lastActiveAt,
+    emailRemindersFrequency,
+  } = user;
   const lastActiveAtString = lastActiveAt?.toISOString() || '';
 
   const crispSchema = {
     marketing_permission: contactPermission,
     service_emails_permission: serviceEmailsPermission,
     last_active_at: lastActiveAtString,
+    email_reminders_frequency: emailRemindersFrequency,
     // Name and language handled on base level profile for crisp
   };
 
@@ -234,7 +272,11 @@ const serializeUserData = (user: UserEntity) => {
       },
     ],
     language: signUpLanguage || 'en',
-    merge_fields: { NAME: name, LACTIVED: lastActiveAtString },
+    merge_fields: {
+      NAME: name,
+      LACTIVED: lastActiveAtString,
+      REMINDFREQ: emailRemindersFrequency,
+    },
   } as ListMemberPartial;
 
   return { crispSchema, mailchimpSchema };
